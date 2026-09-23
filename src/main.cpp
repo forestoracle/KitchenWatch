@@ -29,8 +29,8 @@
  * ============================================================ */
 
 // ---------- Настройки Wi-Fi ----------
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";      // <-- укажите имя сети
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";  // <-- укажите пароль
+const char* WIFI_SSID     = "rainforest";      // <-- укажите имя сети
+const char* WIFI_PASSWORD = "m@rtlet1Bush";  // <-- укажите пароль
 
 // ---------- Панели 8x8 ----------
 #define PANEL_COUNT   4                          // количество панелей
@@ -45,7 +45,13 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";  // <-- укажите пар�
 
 // true  — «змейка» внутри каждой панели (стандарт для матриц 8x8 WS2812);
 // false — построчная разводка (строки идут слева направо).
-const bool kMatrixSerpentineLayout = true;
+const bool kMatrixSerpentineLayout = false;
+
+// ---------- Диагностика разводки матрицы ----------
+// 0 = обычная работа. 1 = «прогон индексов» — по очереди зажигает каждый
+// светодиод FastLED и печатает его индекс в Serial, чтобы сопоставить индекс
+// с физическим положением на матрице (см. runMatrixTest()).
+#define MATRIX_TEST_MODE 0
 
 // ---------- Ориентация дисплея ----------
 // Если изображение зеркальное/перевёрнутое, меняйте нужные флаги (0/1),
@@ -79,7 +85,7 @@ Encoder enc(ENC_CLK_PIN, ENC_DT_PIN, ENC_SW_PIN); // тип задаётся в 
 #define SYNC_TIMEOUT_MS   15000        // сколько ждать NTP до перехода на показания DS1307
 
 // Цвет цифр часов и период обновления кадра.
-#define CLOCK_COLOR       CRGB::White
+#define CLOCK_COLOR       CRGB::Green
 #define CLOCK_REFRESH_MS  500          // перерисовываем часы 2 раза в секунду
 
 CRGB leds[NUM_LEDS];
@@ -90,7 +96,7 @@ WebSocketsServer webSocket(WEBSOCKET_PORT);
 
 // ---------- Текущее состояние ----------
 uint8_t gBrightness = 64;
-CRGB    gColor      = CRGB::White;
+CRGB    gColor      = CRGB::Green;
 bool    gManualMode = false; // true = дисплеем управляет пользователь (JSON)
 
 enum AppState {
@@ -155,6 +161,40 @@ void setPixel(int16_t x, int16_t y, const CRGB& color) {
         return;
     }
     leds[XY((uint8_t)x, (uint8_t)y)] = color;
+}
+
+/* ------------------------------------------------------------
+ *  Диагностика разводки матрицы (MATRIX_TEST_MODE = 1).
+ *  По очереди зажигает светодиоды по индексу FastLED (0..255)
+ *  и выводит в Serial его координаты. Наблюдая за «бегущим»
+ *  красным пикселем, легко определить реальную разводку:
+ *    - пиксель идёт строго слева направо по каждой строке без
+ *      разворотов  -> матрица прогрессивная, нужен
+ *                     kMatrixSerpentineLayout = false;
+ *    - на нечётных строках пиксель идёт в обратную сторону
+ *      (змейкой)    -> kMatrixSerpentineLayout = true;
+ *    - пиксель прыгает между панелями -> неверен порядок/направление
+ *      панелей, попробуйте REVERSE_PANEL_ORDER.
+ * ------------------------------------------------------------ */
+void runMatrixTest() {
+    static unsigned long last = 0;
+    static uint16_t idx = 0;
+
+    if (millis() - last < 300) {
+        return;
+    }
+    last = millis();
+
+    FastLED.clear();
+    leds[idx] = CRGB::Red;
+    FastLED.show();
+
+    Serial.printf("[TEST] idx=%u  panel=%u  px=%u  py=%u\n",
+                  (unsigned)idx,
+                  (unsigned)(idx / 64),
+                  (unsigned)((idx % 64) % 8),
+                  (unsigned)((idx % 64) / 8));
+    idx = (idx + 1) % NUM_LEDS;
 }
 
 /* ------------------------------------------------------------
@@ -557,6 +597,13 @@ void setup() {
  *  Главный цикл.
  * ------------------------------------------------------------ */
 void loop() {
+    // Диагностика разводки матрицы: при MATRIX_TEST_MODE=1 показываем
+    // «прогон индексов» вместо обычного индикатора.
+    if (MATRIX_TEST_MODE) {
+        runMatrixTest();
+        return;
+    }
+
     // Обработка WebSocket-событий (приём команд).
     webSocket.loop();
 
