@@ -4,6 +4,7 @@
 #include <ArduinoJson.h>
 #include <FastLED.h>
 #include <Wire.h>
+#include <EEPROM.h>
 #include <RTClib.h>
 #include <time.h>
 #include <RDA5807.h>
@@ -19,6 +20,7 @@
  *    - WebSockets        — сервер для управления с браузера/телефона
  *    - ArduinoJson       — разбор/генерация JSON-сообщений
  *    - Wire + RTClib     — часы реального времени PCF8563 (I2C)
+ *    - EEPROM            — эмуляция энергонезависимой памяти во flash
  *
  *  Индикатор: 4 панели 8x8, выстроенные в один горизонтальный ряд
  *  (общее поле 32x8). На старте показывается анимация подключения
@@ -33,9 +35,10 @@
  *  без синхронизации. Сеть при этом продолжает периодически
  *  пробоваться в фоне, и при её появлении время тихо синхронизируется.
  *
- *  Настройки радио (станция и громкость) хранятся в EEPROM AT24C02
- *  (если микросхема подключена к шине I2C) и записываются через 10
- *  секунд после последнего изменения — это экономит ресурс ячеек.
+ *  Настройки радио (станция и громкость) хранятся в энергонезависимой
+ *  памяти — эмуляции EEPROM во flash ESP8266 (библиотека EEPROM.h).
+ *  Запись выполняется через 10 секунд после последнего изменения: один
+ *  цикл стирания сектора на пачку изменений экономит ресурс flash.
  * ============================================================ */
 
 // ---------- Настройки Wi-Fi ----------
@@ -85,20 +88,21 @@ RDA5807 rx;
 #define RADIO_DEFAULT_VOLUME 8       // стартовая громкость (0..15)
 #define VOLUME_SHOW_MS       2000    // показ шкалы громкости на матрице после изменения, мс
 
-// ---------- Энергонезависимая память AT24C02 (I2C) ----------
-// Микросхема 2 Кбит = 256 байт, адрес 0x50 (при A0..A2 = 0). Подключена к той
-// же шине I2C, что и PCF8563 / RDA5807 (SDA=D2, SCL=D1). Настройки (станция и
-// громкость) записываются через SAVE_DELAY_MS после последнего изменения,
-// чтобы не изнашивать ресурс ячеек памяти.
-#define AT24C02_ADDR      0x50
-#define AT24C02_WRITE_MS  6      // время цикла записи tWR для AT24C02 (~5 мс)
+// ---------- Энергонезависимая память: эмуляция EEPROM во flash ----------
+// Отдельной EEPROM у ESP8266 нет: Arduino-ядро отводит под неё один сектор
+// flash 4 КБ (у карты 4 МБ — 0x405FB000, сразу за файловой системой).
+// EEPROM.begin(EE_SIZE) читает EE_SIZE байт сектора в RAM, а commit() стирает
+// сектор и записывает данные обратно. Настройки (станция и громкость)
+// записываются через SAVE_DELAY_MS после последнего изменения — одно стирание
+// сектора на пачку изменений экономит ресурс flash.
+#define EE_SIZE           4      // сколько байт нужно (максимум библиотеки — 4096)
 
 #define EE_ADDR_MAGIC     0x00   // сигнатура «настройки записаны»
 #define EE_ADDR_FREQ      0x01   // 2 байта: частота в единицах 10 кГц
 #define EE_ADDR_VOLUME    0x03   // 1 байт: громкость 0..15
 #define EE_MAGIC          0x4B   // 'K' — KitchenWatch
 
-#define SAVE_DELAY_MS     10000  // пауза после изменения до записи в EEPROM, мс
+#define SAVE_DELAY_MS     10000  // пауза после изменения до записи во flash, мс
 
 // ---------- Энкодер ----------
 // Поворот — поиск следующей/предыдущей станции; кнопка — переключение
@@ -120,8 +124,9 @@ Encoder enc(ENC_CLK_PIN, ENC_DT_PIN, ENC_SW_PIN); // тип задаётся в 
 #define WIFI_ATTEMPT_TIMEOUT_MS  10000  // таймаут одной попытки подключения, мс
 #define WIFI_RECONNECT_MS        60000  // период фоновых попыток восстановления связи, мс
 
-// Цвет цифр часов и период обновления кадра.
-#define CLOCK_COLOR       CRGB::Green
+// Цвета индикации и период обновления кадра.
+#define CLOCK_COLOR       CRGB::Green  // цифры часов
+#define FREQ_COLOR        CRGB::Blue   // цифры частоты: горит только синий канал — меньше ток
 #define CLOCK_REFRESH_MS  500          // перерисовываем часы 2 раза в секунду
 
 CRGB leds[NUM_LEDS];
@@ -168,44 +173,50 @@ uint8_t  gRadioVolume = RADIO_DEFAULT_VOLUME; // текущая громкост
 bool          gVolumeOverlay   = false; // true = показываем шкалу громкости
 unsigned long gVolumeOverlayMs = 0;     // момент последнего изменения громкости
 
-bool          gEepromFound       = false; // true = AT24C02 найден на шине I2C
+bool          gEepromReady       = false; // true = EEPROM.begin() выполнен
 bool          gSettingsDirty     = false; // true = настройки изменены, ждём запись
 unsigned long gSettingsChangedMs = 0;     // момент последнего изменения настроек
 
 /* ------------------------------------------------------------
- *  AT24C02 (I2C EEPROM): определение, чтение и запись байт.
- *  Адрес микросхемы — AT24C02_ADDR (0x50 при A0..A2 = 0).
+ *  Энергонезависимая память: эмуляция EEPROM во flash ESP8266.
+ *  begin() отводит EE_SIZE байт кучи и читает их из сектора
+ *  flash; write() меняет только RAM-копию, commit() стирает
+ *  сектор и записывает копию обратно.
  * ------------------------------------------------------------ */
-bool eepromDetect() {
-    Wire.beginTransmission(AT24C02_ADDR);
-    return (Wire.endTransmission() == 0);
+bool eepromInit() {
+    EEPROM.begin(EE_SIZE);   // в ядре ESP8266 begin() возвращает void
+    gEepromReady = ((size_t)EEPROM.length() == (size_t)EE_SIZE);
+    return gEepromReady;
 }
 
-// Чтение одного байта по адресу addr; false — ошибка шины.
+// Чтение одного байта из RAM-копии (flash при этом не читается).
 bool eepromReadByte(uint8_t addr, uint8_t& value) {
-    Wire.beginTransmission(AT24C02_ADDR);
-    Wire.write(addr);
-    if (Wire.endTransmission() != 0) {
+    if (!gEepromReady || addr >= EE_SIZE) {
         return false;
     }
-    if (Wire.requestFrom(AT24C02_ADDR, 1) != 1) {
-        return false;
-    }
-    value = (uint8_t)Wire.read();
+    value = EEPROM.read(addr);
     return true;
 }
 
-// Запись одного байта; после записи выдерживается цикл tWR.
+// Запись одного байта в RAM-копию; во flash — только по eepromCommit().
+// Если байт не изменился, признак «данные изменены» не выставляется.
 void eepromWriteByte(uint8_t addr, uint8_t value) {
-    Wire.beginTransmission(AT24C02_ADDR);
-    Wire.write(addr);
-    Wire.write(value);
-    Wire.endTransmission();
-    delay(AT24C02_WRITE_MS);
+    if (!gEepromReady || addr >= EE_SIZE) {
+        return;
+    }
+    EEPROM.write(addr, value);
+}
+
+// Сброс RAM-копии во flash: стирание сектора + запись EE_SIZE байт.
+bool eepromCommit() {
+    if (!gEepromReady) {
+        return false;
+    }
+    return EEPROM.commit();
 }
 
 /* ------------------------------------------------------------
- *  Прочитать сохранённые станцию и громкость из AT24C02.
+ *  Прочитать сохранённые станцию и громкость из flash.
  *  При отсутствии/некорректности данных остаются значения по
  *  умолчанию (RADIO_DEFAULT_FREQ / RADIO_DEFAULT_VOLUME).
  * ------------------------------------------------------------ */
@@ -236,13 +247,16 @@ void loadSettings() {
 }
 
 /* ------------------------------------------------------------
- *  Записать текущие станцию и громкость в AT24C02.
- *  Сигнатура пишется последней: при сбое питания посреди записи
- *  она не окажется выставленной раньше самих данных.
+ *  Записать текущие станцию и громкость в энергонезависимую
+ *  память. Сначала обновляется RAM-копия, затем одним commit()
+ *  перезаписывается сектор flash — одно стирание на пачку
+ *  изменений. При сбое питания посреди записи сигнатура
+ *  EE_MAGIC может не записаться, и данные будут отвергнуты.
+ *  true — данные записаны во flash; false — ошибка записи.
  * ------------------------------------------------------------ */
-void saveSettings() {
-    if (!gEepromFound) {
-        return;
+bool saveSettings() {
+    if (!gEepromReady) {
+        return false;
     }
     uint16_t freq = gRadioFound ? rx.getFrequency() : gRadioFreq;
     uint8_t  vol  = gRadioVolume;
@@ -252,12 +266,18 @@ void saveSettings() {
     eepromWriteByte(EE_ADDR_VOLUME,   vol);
     eepromWriteByte(EE_ADDR_MAGIC,    EE_MAGIC);
 
+    if (!eepromCommit()) {
+        Serial.println("[EEPROM] commit failed — will retry later");
+        return false;
+    }
+
     gRadioFreq = freq;
     Serial.printf("[EEPROM] saved: freq=%u vol=%u\n", freq, vol);
+    return true;
 }
 
 /* ------------------------------------------------------------
- *  Отметить, что настройки изменились: запись в EEPROM будет
+ *  Отметить, что настройки изменились: запись во flash будет
  *  выполнена через SAVE_DELAY_MS после последнего изменения.
  * ------------------------------------------------------------ */
 void markSettingsChanged() {
@@ -266,16 +286,21 @@ void markSettingsChanged() {
 }
 
 /* ------------------------------------------------------------
- *  Отложенная (через SAVE_DELAY_MS) запись настроек в EEPROM.
+ *  Отложенная (через SAVE_DELAY_MS) запись настроек во flash.
  *  Вызывается из loop(); ничего не делает, пока пауза не истекла.
+ *  При ошибке записи настройки остаются «грязными» и попытка
+ *  повторяется ещё через SAVE_DELAY_MS.
  * ------------------------------------------------------------ */
 void serviceSettingsSave() {
-    if (!gSettingsDirty || !gEepromFound) {
+    if (!gSettingsDirty || !gEepromReady) {
         return;
     }
     if (millis() - gSettingsChangedMs >= SAVE_DELAY_MS) {
-        saveSettings();
-        gSettingsDirty = false;
+        if (saveSettings()) {
+            gSettingsDirty = false;
+        } else {
+            gSettingsChangedMs = millis(); // повторим попытку позже
+        }
     }
 }
 
@@ -468,18 +493,18 @@ void drawFrequency() {
     FastLED.clear();
 
     if (intPart >= 100) {
-        drawDigit((intPart / 100) % 10, 0, CLOCK_COLOR);
-        drawDigit((intPart / 10)  % 10, 1, CLOCK_COLOR);
+        drawDigit((intPart / 100) % 10, 0, FREQ_COLOR);
+        drawDigit((intPart / 10)  % 10, 1, FREQ_COLOR);
     } else {
         // Частоты ниже 100 МГц — первая панель пустая, цифры сдвинуты вправо.
-        drawDigit((intPart / 10) % 10, 1, CLOCK_COLOR);
+        drawDigit((intPart / 10) % 10, 1, FREQ_COLOR);
     }
-    drawDigit(intPart % 10, 2, CLOCK_COLOR);
-    drawDigit(frac, 3, CLOCK_COLOR);
+    drawDigit(intPart % 10, 2, FREQ_COLOR);
+    drawDigit(frac, 3, FREQ_COLOR);
 
     // Десятичная точка в правом нижнем углу панели с единицами (панель 2).
-    setPixel(2 * PANEL_SIZE + 6, 7, CLOCK_COLOR);
-    setPixel(2 * PANEL_SIZE + 7, 7, CLOCK_COLOR);
+    setPixel(2 * PANEL_SIZE + 6, 7, FREQ_COLOR);
+    setPixel(2 * PANEL_SIZE + 7, 7, FREQ_COLOR);
 
     // Зелёная точка — индикатор Wi-Fi (как на экране часов).
     if (WiFi.status() == WL_CONNECTED) {
@@ -905,16 +930,15 @@ void setup() {
         }
     }
 
-    // 4. EEPROM AT24C02, FM-приёмник RDA5807 и энкодер.
+    // 4. Энергонезависимая память, FM-приёмник RDA5807 и энкодер.
     Wire.begin(); // SDA=D2, SCL=D1 (уже инициализирована для PCF8563)
 
-    // 4a. Энергонезависимая память (если подключена) — читаем настройки.
-    gEepromFound = eepromDetect();
-    if (gEepromFound) {
-        Serial.println("[EEPROM] AT24C02 found on I2C.");
+    // 4a. Энергонезависимая память — эмуляция EEPROM во flash ESP8266.
+    if (eepromInit()) {
+        Serial.printf("[EEPROM] flash emulation ready (%u bytes).\n", (unsigned)EE_SIZE);
         loadSettings(); // заполняет gRadioFreq / gRadioVolume
     } else {
-        Serial.println("[EEPROM] AT24C02 not found — settings will not be persisted.");
+        Serial.println("[EEPROM] init failed — settings will not be persisted.");
     }
 
     // 4b. FM-приёмник.
