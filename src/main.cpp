@@ -35,10 +35,11 @@
  *  без синхронизации. Сеть при этом продолжает периодически
  *  пробоваться в фоне, и при её появлении время тихо синхронизируется.
  *
- *  Настройки радио (станция и громкость) хранятся в энергонезависимой
- *  памяти — эмуляции EEPROM во flash ESP8266 (библиотека EEPROM.h).
- *  Запись выполняется через 10 секунд после последнего изменения: один
- *  цикл стирания сектора на пачку изменений экономит ресурс flash.
+ *  Настройки (яркость матрицы, станция, громкость и цвета цифр
+ *  часов/частоты) хранятся в энергонезависимой памяти — эмуляции EEPROM
+ *  во flash ESP8266 (библиотека EEPROM.h). Запись выполняется через
+ *  10 секунд после последнего изменения: один цикл стирания сектора на
+ *  пачку изменений экономит ресурс flash.
  * ============================================================ */
 
 // ---------- Настройки Wi-Fi ----------
@@ -55,6 +56,7 @@ const char* WIFI_PASSWORD = "m@rtlet1Bush";  // <-- укажите пароль
 // ---------- Настройки LED-матрицы ----------
 #define LED_PIN     2       // GPIO2 (D4) — линия данных
 #define COLOR_ORDER GRB     // порядок каналов цвета (WS2812B -> GRB)
+#define LED_DEFAULT_BRIGHTNESS 64 // стартовая яркость 0..255 (если во flash нет сохранённой)
 
 // true  — «змейка» внутри каждой панели (стандарт для матриц 8x8 WS2812);
 // false — построчная разводка (строки идут слева направо).
@@ -92,17 +94,33 @@ RDA5807 rx;
 // Отдельной EEPROM у ESP8266 нет: Arduino-ядро отводит под неё один сектор
 // flash 4 КБ (у карты 4 МБ — 0x405FB000, сразу за файловой системой).
 // EEPROM.begin(EE_SIZE) читает EE_SIZE байт сектора в RAM, а commit() стирает
-// сектор и записывает данные обратно. Настройки (станция и громкость)
-// записываются через SAVE_DELAY_MS после последнего изменения — одно стирание
-// сектора на пачку изменений экономит ресурс flash.
-#define EE_SIZE           4      // сколько байт нужно (максимум библиотеки — 4096)
+// сектор и записывает данные обратно. Настройки (яркость, станция, громкость и
+// цвета цифр) записываются через SAVE_DELAY_MS после последнего изменения — одно
+// стирание сектора на пачку изменений экономит ресурс flash.
+#define EE_SIZE           16     // сколько байт нужно (максимум библиотеки — 4096);
+                                 // 16 — уже кратно 4 байтам
 
-#define EE_ADDR_MAGIC     0x00   // сигнатура «настройки записаны»
-#define EE_ADDR_FREQ      0x01   // 2 байта: частота в единицах 10 кГц
-#define EE_ADDR_VOLUME    0x03   // 1 байт: громкость 0..15
-#define EE_MAGIC          0x4B   // 'K' — KitchenWatch
+#define EE_ADDR_MAGIC       0x00 // сигнатура «настройки радио записаны»
+#define EE_ADDR_FREQ        0x01 // 2 байта: частота в единицах 10 кГц
+#define EE_ADDR_VOLUME      0x03 // 1 байт: громкость 0..15
+#define EE_ADDR_CLOCK_R     0x04 // 3 байта: цвет цифр часов (R, G, B)
+#define EE_ADDR_CLOCK_G     0x05
+#define EE_ADDR_CLOCK_B     0x06
+#define EE_ADDR_FREQ_R      0x07 // 3 байта: цвет цифр частоты (R, G, B)
+#define EE_ADDR_FREQ_G      0x08
+#define EE_ADDR_FREQ_B      0x09
+#define EE_ADDR_COLOR_MAGIC 0x0A // сигнатура «цвета сохранены»
+#define EE_ADDR_BRIGHTNESS  0x0B // 1 байт: яркость матрицы 0..255
+#define EE_ADDR_BRIGHT_MAGIC 0x0C // сигнатура «яркость сохранена»
+#define EE_MAGIC            0x4B // 'K' — KitchenWatch
+#define EE_COLOR_MAGIC      0xC1 // сигнатура блока цветов цифр
+#define EE_BRIGHT_MAGIC     0xB7 // сигнатура блока яркости
 
 #define SAVE_DELAY_MS     10000  // пауза после изменения до записи во flash, мс
+
+// Минимальный интервал авторассылки состояния клиентам WebSocket после
+// изменения настроек (громкость при повороте энкодера «трещит» по щелчкам).
+#define STATE_PUSH_INTERVAL_MS 150
 
 // ---------- Энкодер ----------
 // Поворот — поиск следующей/предыдущей станции; кнопка — переключение
@@ -124,7 +142,9 @@ Encoder enc(ENC_CLK_PIN, ENC_DT_PIN, ENC_SW_PIN); // тип задаётся в 
 #define WIFI_ATTEMPT_TIMEOUT_MS  10000  // таймаут одной попытки подключения, мс
 #define WIFI_RECONNECT_MS        60000  // период фоновых попыток восстановления связи, мс
 
-// Цвета индикации и период обновления кадра.
+// Цвета индикации по умолчанию и период обновления кадра.
+// Текущие цвета хранятся в gClockColor / gFreqColor: их можно менять
+// командами WebSocket и они сохраняются в EEPROM.
 #define CLOCK_COLOR       CRGB::Green  // цифры часов
 #define FREQ_COLOR        CRGB::Blue   // цифры частоты: горит только синий канал — меньше ток
 #define CLOCK_REFRESH_MS  500          // перерисовываем часы 2 раза в секунду
@@ -136,9 +156,14 @@ CRGB leds[NUM_LEDS];
 WebSocketsServer webSocket(WEBSOCKET_PORT);
 
 // ---------- Текущее состояние ----------
-uint8_t gBrightness = 64;
+uint8_t gBrightness = LED_DEFAULT_BRIGHTNESS; // яркость 0..255, сохраняется в EEPROM
 CRGB    gColor      = CRGB::Green;
 bool    gManualMode = false; // true = дисплеем управляет пользователь (JSON)
+
+// Текущие цвета цифр (меняются командами clock_color / freq_color,
+// сохраняются в EEPROM вместе с остальными настройками).
+CRGB    gClockColor = CLOCK_COLOR;
+CRGB    gFreqColor  = FREQ_COLOR;
 
 enum AppState {
     STATE_CONNECTING, // Wi-Fi ещё не подключён — показываем анимацию
@@ -176,6 +201,11 @@ unsigned long gVolumeOverlayMs = 0;     // момент последнего и�
 bool          gEepromReady       = false; // true = EEPROM.begin() выполнен
 bool          gSettingsDirty     = false; // true = настройки изменены, ждём запись
 unsigned long gSettingsChangedMs = 0;     // момент последнего изменения настроек
+
+// Авторассылка состояния клиентам WebSocket после изменений. Сама рассылка
+// выполняется из loop() не чаще STATE_PUSH_INTERVAL_MS.
+bool          gStateDirty        = false; // true = состояние изменилось
+unsigned long gStateDirtyMs      = 0;     // момент последнего изменения состояния
 
 /* ------------------------------------------------------------
  *  Энергонезависимая память: эмуляция EEPROM во flash ESP8266.
@@ -216,9 +246,10 @@ bool eepromCommit() {
 }
 
 /* ------------------------------------------------------------
- *  Прочитать сохранённые станцию и громкость из flash.
- *  При отсутствии/некорректности данных остаются значения по
- *  умолчанию (RADIO_DEFAULT_FREQ / RADIO_DEFAULT_VOLUME).
+ *  Прочитать сохранённые яркость, станцию, громкость и цвета цифр
+ *  из flash. При отсутствии/некорректности данных остаются значения
+ *  по умолчанию (LED_DEFAULT_BRIGHTNESS / RADIO_DEFAULT_FREQ /
+ *  RADIO_DEFAULT_VOLUME / CLOCK_COLOR / FREQ_COLOR).
  * ------------------------------------------------------------ */
 void loadSettings() {
     uint8_t magic = 0;
@@ -243,15 +274,47 @@ void loadSettings() {
         gRadioVolume = vol;
     }
 
-    Serial.printf("[EEPROM] loaded: freq=%u vol=%u\n", gRadioFreq, gRadioVolume);
+    // Цвета цифр хранятся с отдельной сигнатурой: настройки, записанные
+    // прежней прошивкой, не должны дать случайный цвет (0xFF во flash).
+    uint8_t colorMagic = 0;
+    if (eepromReadByte(EE_ADDR_COLOR_MAGIC, colorMagic) &&
+        colorMagic == EE_COLOR_MAGIC) {
+        uint8_t cr = 0, cg = 0, cb = 0, fr = 0, fg = 0, fb = 0;
+        if (eepromReadByte(EE_ADDR_CLOCK_R, cr) &&
+            eepromReadByte(EE_ADDR_CLOCK_G, cg) &&
+            eepromReadByte(EE_ADDR_CLOCK_B, cb) &&
+            eepromReadByte(EE_ADDR_FREQ_R, fr) &&
+            eepromReadByte(EE_ADDR_FREQ_G, fg) &&
+            eepromReadByte(EE_ADDR_FREQ_B, fb)) {
+            gClockColor = CRGB(cr, cg, cb);
+            gFreqColor  = CRGB(fr, fg, fb);
+        }
+    }
+
+    // Яркость также хранится с отдельной сигнатурой: байт, оставшийся
+    // от прежней прошивки (0xFF во flash), не должен дать яркость 255.
+    uint8_t brightMagic = 0;
+    if (eepromReadByte(EE_ADDR_BRIGHT_MAGIC, brightMagic) &&
+        brightMagic == EE_BRIGHT_MAGIC) {
+        uint8_t bright = 0;
+        if (eepromReadByte(EE_ADDR_BRIGHTNESS, bright)) {
+            gBrightness = bright;
+        }
+    }
+
+    Serial.printf("[EEPROM] loaded: freq=%u vol=%u bright=%u clock=(%u,%u,%u) freq_col=(%u,%u,%u)\n",
+                  gRadioFreq, gRadioVolume, gBrightness,
+                  gClockColor.r, gClockColor.g, gClockColor.b,
+                  gFreqColor.r, gFreqColor.g, gFreqColor.b);
 }
 
 /* ------------------------------------------------------------
- *  Записать текущие станцию и громкость в энергонезависимую
- *  память. Сначала обновляется RAM-копия, затем одним commit()
- *  перезаписывается сектор flash — одно стирание на пачку
- *  изменений. При сбое питания посреди записи сигнатура
- *  EE_MAGIC может не записаться, и данные будут отвергнуты.
+ *  Записать текущие яркость, станцию, громкость и цвета цифр в
+ *  энергонезависимую память. Сначала обновляется RAM-копия,
+ *  затем одним commit() перезаписывается сектор flash — одно
+ *  стирание на пачку изменений. При сбое питания посреди записи
+ *  сигнатуры EE_MAGIC / EE_COLOR_MAGIC / EE_BRIGHT_MAGIC могут не
+ *  записаться, и соответствующие данные будут отвергнуты.
  *  true — данные записаны во flash; false — ошибка записи.
  * ------------------------------------------------------------ */
 bool saveSettings() {
@@ -266,13 +329,26 @@ bool saveSettings() {
     eepromWriteByte(EE_ADDR_VOLUME,   vol);
     eepromWriteByte(EE_ADDR_MAGIC,    EE_MAGIC);
 
+    eepromWriteByte(EE_ADDR_CLOCK_R,  gClockColor.r);
+    eepromWriteByte(EE_ADDR_CLOCK_G,  gClockColor.g);
+    eepromWriteByte(EE_ADDR_CLOCK_B,  gClockColor.b);
+    eepromWriteByte(EE_ADDR_FREQ_R,   gFreqColor.r);
+    eepromWriteByte(EE_ADDR_FREQ_G,   gFreqColor.g);
+    eepromWriteByte(EE_ADDR_FREQ_B,   gFreqColor.b);
+    eepromWriteByte(EE_ADDR_COLOR_MAGIC, EE_COLOR_MAGIC);
+
+    // Яркость пишется последней вместе со своей сигнатурой.
+    eepromWriteByte(EE_ADDR_BRIGHTNESS,   gBrightness);
+    eepromWriteByte(EE_ADDR_BRIGHT_MAGIC, EE_BRIGHT_MAGIC);
+
     if (!eepromCommit()) {
         Serial.println("[EEPROM] commit failed — will retry later");
         return false;
     }
 
     gRadioFreq = freq;
-    Serial.printf("[EEPROM] saved: freq=%u vol=%u\n", freq, vol);
+    Serial.printf("[EEPROM] saved: freq=%u vol=%u bright=%u\n",
+                  freq, vol, gBrightness);
     return true;
 }
 
@@ -446,15 +522,15 @@ void drawClock() {
 
     FastLED.clear();
 
-    drawDigit(now.hour() / 10, 0, CLOCK_COLOR);
-    drawDigit(now.hour() % 10, 1, CLOCK_COLOR);
-    drawDigit(now.minute() / 10, 2, CLOCK_COLOR);
-    drawDigit(now.minute() % 10, 3, CLOCK_COLOR);
+    drawDigit(now.hour() / 10, 0, gClockColor);
+    drawDigit(now.hour() % 10, 1, gClockColor);
+    drawDigit(now.minute() / 10, 2, gClockColor);
+    drawDigit(now.minute() % 10, 3, gClockColor);
 
     // Мигающее двоеточие между часами и минутами (гаснет каждую секунду).
     if ((now.second() & 0x01) == 0) {
-        setPixel(15, 2, CLOCK_COLOR);
-        setPixel(15, 4, CLOCK_COLOR);
+        setPixel(15, 2, gClockColor);
+        setPixel(15, 4, gClockColor);
     }
 
     // Зелёная точка — индикатор успешного Wi-Fi подключения.
@@ -493,18 +569,18 @@ void drawFrequency() {
     FastLED.clear();
 
     if (intPart >= 100) {
-        drawDigit((intPart / 100) % 10, 0, FREQ_COLOR);
-        drawDigit((intPart / 10)  % 10, 1, FREQ_COLOR);
+        drawDigit((intPart / 100) % 10, 0, gFreqColor);
+        drawDigit((intPart / 10)  % 10, 1, gFreqColor);
     } else {
         // Частоты ниже 100 МГц — первая панель пустая, цифры сдвинуты вправо.
-        drawDigit((intPart / 10) % 10, 1, FREQ_COLOR);
+        drawDigit((intPart / 10) % 10, 1, gFreqColor);
     }
-    drawDigit(intPart % 10, 2, FREQ_COLOR);
-    drawDigit(frac, 3, FREQ_COLOR);
+    drawDigit(intPart % 10, 2, gFreqColor);
+    drawDigit(frac, 3, gFreqColor);
 
     // Десятичная точка в правом нижнем углу панели с единицами (панель 2).
-    setPixel(2 * PANEL_SIZE + 6, 7, FREQ_COLOR);
-    setPixel(2 * PANEL_SIZE + 7, 7, FREQ_COLOR);
+    setPixel(2 * PANEL_SIZE + 6, 7, gFreqColor);
+    setPixel(2 * PANEL_SIZE + 7, 7, gFreqColor);
 
     // Зелёная точка — индикатор Wi-Fi (как на экране часов).
     if (WiFi.status() == WL_CONNECTED) {
@@ -692,6 +768,9 @@ void serviceNetwork() {
     }
 }
 
+// Прототип: определение ниже (используется при изменении состояния).
+void notifyStateChanged();
+
 /* ------------------------------------------------------------
  *  Ручной режим: заливка всей матрицы текущим цветом/яркостью.
  * ------------------------------------------------------------ */
@@ -702,11 +781,166 @@ void applyManualColor() {
 }
 
 /* ------------------------------------------------------------
+ *  Переключить индикацию «часы ⇄ частота».
+ *  Используется и кнопкой энкодера, и командой WebSocket.
+ * ------------------------------------------------------------ */
+void toggleDisplayMode() {
+    gDisplayMode   = (gDisplayMode == DISPLAY_TIME) ? DISPLAY_FREQ : DISPLAY_TIME;
+    gVolumeOverlay = false; // переключение отменяет показ шкалы громкости
+    gLastDrawMs    = 0;     // перерисовать немедленно
+    Serial.printf("[UI] display -> %s\n",
+                  gDisplayMode == DISPLAY_TIME ? "TIME" : "FREQ");
+    notifyStateChanged(); // сообщить клиентам WebSocket
+}
+
+// Прототип: определение ниже (используется командами next / prev).
+void seekStation(uint8_t direction);
+
+/* ------------------------------------------------------------
+ *  Сформировать JSON с текущими настройками и состоянием.
+ *  Используется как ответ на команду {"cmd":"get"} (алиас "status")
+ *  и как приветствие при подключении клиента.
+ * ------------------------------------------------------------ */
+void buildStateJson(String& out) {
+    JsonDocument doc;
+    doc["cmd"] = "state";
+
+    // Индикатор
+    doc["brightness"] = gBrightness;
+    doc["manual"]     = gManualMode;
+    doc["display"]    = (gDisplayMode == DISPLAY_TIME) ? "time" : "freq";
+
+    JsonObject color = doc["color"].to<JsonObject>();
+    color["r"] = gColor.r;
+    color["g"] = gColor.g;
+    color["b"] = gColor.b;
+
+    JsonObject clockColor = doc["clock_color"].to<JsonObject>();
+    clockColor["r"] = gClockColor.r;
+    clockColor["g"] = gClockColor.g;
+    clockColor["b"] = gClockColor.b;
+
+    JsonObject freqColor = doc["freq_color"].to<JsonObject>();
+    freqColor["r"] = gFreqColor.r;
+    freqColor["g"] = gFreqColor.g;
+    freqColor["b"] = gFreqColor.b;
+
+    // Радио: frequency — МГц для UI, frequency_raw — единицы 10 кГц.
+    uint16_t freq = gRadioFound ? rx.getFrequency() : gRadioFreq;
+    doc["frequency"]     = freq / 100.0;
+    doc["frequency_raw"] = freq;
+    doc["volume"]        = gRadioVolume;
+    doc["rssi"]          = gRadioFound ? rx.getRssi() : 0;
+
+    // Время и состояние подсистем.
+    if (gRtcFound) {
+        DateTime now = rtc.now();
+        char buf[12];
+        snprintf(buf, sizeof(buf), "%02u:%02u:%02u",
+                 (unsigned)now.hour(), (unsigned)now.minute(),
+                 (unsigned)now.second());
+        doc["time"] = buf; // ArduinoJson копирует значение при сериализации
+    }
+    doc["wifi"]        = (WiFi.status() == WL_CONNECTED);
+    doc["time_synced"] = gTimeSynced;
+    doc["rtc"]         = gRtcFound;
+    doc["radio"]       = gRadioFound;
+    doc["eeprom"]      = gEepromReady;
+    doc["dirty"]       = gSettingsDirty; // настройки ещё не записаны во flash
+
+    out = "";
+    out.reserve(384);   // без лишней фрагментации кучи
+    serializeJson(doc, out);
+}
+
+/* ------------------------------------------------------------
+ *  Отправить состояние всем подключённым клиентам.
+ * ------------------------------------------------------------ */
+void broadcastState() {
+    String out;
+    buildStateJson(out);
+    webSocket.broadcastTXT(out);
+}
+
+/* ------------------------------------------------------------
+ *  Отметить изменение состояния: рассылка будет выполнена из loop()
+ *  не чаще STATE_PUSH_INTERVAL_MS. Ответ на команду get уходит сразу
+ *  и от этой задержки не зависит.
+ * ------------------------------------------------------------ */
+void notifyStateChanged() {
+    gStateDirty   = true;
+    gStateDirtyMs = millis();
+}
+
+/* ------------------------------------------------------------
+ *  Отложенная авторассылка состояния клиентам (вызывается из loop()).
+ * ------------------------------------------------------------ */
+void serviceStateBroadcast() {
+    if (!gStateDirty) {
+        return;
+    }
+    if (millis() - gStateDirtyMs < STATE_PUSH_INTERVAL_MS) {
+        return;
+    }
+    gStateDirty = false;
+    broadcastState();
+}
+
+/* ------------------------------------------------------------
+ *  Настроить приёмник на заданную частоту (единицы 10 кГц).
+ *  Частота выравнивается по сетке 0.1 МГц и ограничивается
+ *  FM-диапазоном 87.5..108.0 МГц. Новая станция сохраняется
+ *  в EEPROM через SAVE_DELAY_MS (см. markSettingsChanged()).
+ * ------------------------------------------------------------ */
+void setRadioFrequency(uint16_t freq) {
+    if (!gRadioFound) {
+        Serial.println("[RADIO] not found — frequency ignored");
+        return;
+    }
+
+    if (freq < 8750)  freq = 8750;   // FM-диапазон 87.5..108.0 МГц
+    if (freq > 10800) freq = 10800;
+    freq = (uint16_t)(((freq + 5) / 10) * 10); // шаг сетки 0.1 МГц
+
+    rx.setFrequency(freq);
+    gRadioFreq     = rx.getFrequency();
+    gDisplayMode   = DISPLAY_FREQ; // показать частоту на матрице
+    gVolumeOverlay = false;
+    gLastDrawMs    = 0;
+
+    // В ручном режиме матрицу не перерисовываем: смена индикации
+    // станет видна после команды "auto".
+    if (!gManualMode) {
+        drawFrequency();
+        gLastDrawMs = millis();
+    }
+
+    markSettingsChanged(); // сохранится через SAVE_DELAY_MS
+    notifyStateChanged();  // и разошлём новое состояние клиентам WebSocket
+
+    Serial.printf("[RADIO] frequency set to %u.%u MHz\n",
+                  (unsigned)(gRadioFreq / 100),
+                  (unsigned)((gRadioFreq / 10) % 10));
+}
+
+/* ------------------------------------------------------------
  *  Обработчик событий WebSocket.
- *  Команды (JSON): {"cmd":"color","r":..,"g":..,"b":..},
- *                  {"cmd":"brightness","value":..},
- *                  {"cmd":"on"}, {"cmd":"off"}, {"cmd":"auto"}.
+ *  Команды (JSON):
+ *    {"cmd":"color","r":..,"g":..,"b":..}       — залить матрицу цветом;
+ *    {"cmd":"brightness","value":..}            — яркость матрицы;
+ *    {"cmd":"volume","value":..}                — громкость приёмника;
+ *    {"cmd":"frequency","value":103.9}          — частота приёмника
+ *                                                 (МГц или единицы 10 кГц);
+ *    {"cmd":"next"} / {"cmd":"prev"}             — следующая/предыдущая станция;
+ *    {"cmd":"toggle"}                            — индикация «часы ⇄ частота»;
+ *    {"cmd":"clock_color","r":..,"g":..,"b":..} — цвет цифр часов;
+ *    {"cmd":"freq_color","r":..,"g":..,"b":..}  — цвет цифр частоты;
+ *    {"cmd":"get"} / {"cmd":"status"}           — прислать текущие настройки;
+ *    {"cmd":"on"}, {"cmd":"off"}, {"cmd":"auto"}.
  *  "auto" возвращает автоматический режим индикатора.
+ *  Ответы: при подключении — {"status":"connected"} и снимок состояния
+ *  {"cmd":"state",...}; на get/status — снимок состояния; после изменения
+ *  настроек — авторассылка состояния всем подключённым клиентам.
  * ------------------------------------------------------------ */
 void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
     switch (type) {
@@ -719,6 +953,11 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
             Serial.printf("[WS] client #%u connected from %d.%d.%d.%d\n",
                           num, ip[0], ip[1], ip[2], ip[3]);
             webSocket.sendTXT(num, "{\"status\":\"connected\"}");
+
+            // Сразу отдаём текущие настройки, чтобы UI не ждал запроса.
+            String out;
+            buildStateJson(out);
+            webSocket.sendTXT(num, out);
             break;
         }
 
@@ -740,12 +979,15 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
                 gColor = CRGB(r, g, b);
                 gManualMode = true;
                 applyManualColor();
+                notifyStateChanged();
                 Serial.printf("[WS] color set to (%u, %u, %u)\n", r, g, b);
             }
             else if (strcmp(cmd, "brightness") == 0) {
                 gBrightness = doc["value"] | gBrightness;
                 FastLED.setBrightness(gBrightness);
                 FastLED.show();
+                markSettingsChanged(); // сохранится через SAVE_DELAY_MS
+                notifyStateChanged();
                 Serial.printf("[WS] brightness set to %u\n", gBrightness);
             }
             else if (strcmp(cmd, "volume") == 0) {
@@ -758,21 +1000,75 @@ void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t lengt
                     rx.setVolume(gRadioVolume);
                 }
                 markSettingsChanged(); // сохранится через SAVE_DELAY_MS
+                notifyStateChanged();
                 Serial.printf("[WS] volume set to %u\n", gRadioVolume);
+            }
+            else if (strcmp(cmd, "frequency") == 0) {
+                if (doc["value"].isNull()) {
+                    Serial.println("[WS] frequency: missing \"value\"");
+                } else {
+                    double v = doc["value"].as<double>();
+                    // 103.9 — МГц; 10390 — единицы 10 кГц (как RADIO_DEFAULT_FREQ).
+                    uint16_t freq = (v > 200.0) ? (uint16_t)(v + 0.5)
+                                                : (uint16_t)(v * 100.0 + 0.5);
+                    setRadioFrequency(freq);
+                }
+            }
+            else if (strcmp(cmd, "next") == 0) {
+                seekStation(RDA_SEEK_UP);
+            }
+            else if (strcmp(cmd, "prev") == 0) {
+                seekStation(RDA_SEEK_DOWN);
+            }
+            else if (strcmp(cmd, "toggle") == 0) {
+                toggleDisplayMode();
+            }
+            else if (strcmp(cmd, "clock_color") == 0) {
+                // Неуказанные компоненты сохраняют текущее значение.
+                uint8_t r = doc["r"] | gClockColor.r;
+                uint8_t g = doc["g"] | gClockColor.g;
+                uint8_t b = doc["b"] | gClockColor.b;
+                gClockColor = CRGB(r, g, b);
+                gLastDrawMs = 0; // перерисовать часы немедленно (в авторежиме)
+                markSettingsChanged();
+                notifyStateChanged();
+                Serial.printf("[WS] clock color set to (%u, %u, %u)\n", r, g, b);
+            }
+            else if (strcmp(cmd, "freq_color") == 0) {
+                uint8_t r = doc["r"] | gFreqColor.r;
+                uint8_t g = doc["g"] | gFreqColor.g;
+                uint8_t b = doc["b"] | gFreqColor.b;
+                gFreqColor = CRGB(r, g, b);
+                gLastDrawMs = 0; // перерисовать частоту немедленно (в авторежиме)
+                markSettingsChanged();
+                notifyStateChanged();
+                Serial.printf("[WS] freq color set to (%u, %u, %u)\n", r, g, b);
+            }
+            else if (strcmp(cmd, "get") == 0 || strcmp(cmd, "status") == 0) {
+                // Ответ отправляется только запросившему клиенту и сразу,
+                // без задержки авторассылки.
+                String out;
+                buildStateJson(out);
+                webSocket.sendTXT(num, out);
+                Serial.printf("[WS] state sent to client #%u (%u bytes)\n",
+                              num, (unsigned)out.length());
             }
             else if (strcmp(cmd, "off") == 0) {
                 gManualMode = true;
                 FastLED.clear(true);
+                notifyStateChanged();
                 Serial.println("[WS] LEDs off");
             }
             else if (strcmp(cmd, "on") == 0) {
                 gManualMode = true;
                 applyManualColor();
+                notifyStateChanged();
                 Serial.println("[WS] LEDs on");
             }
             else if (strcmp(cmd, "auto") == 0) {
                 gManualMode = false;
                 gLastDrawMs = 0; // немедленно вернуться к отображению часов/индикатора
+                notifyStateChanged();
                 Serial.println("[WS] auto indicator mode");
             }
             else {
@@ -804,9 +1100,11 @@ bool radioDetect() {
 
 /* ------------------------------------------------------------
  *  Поиск FM-станции в заданном направлении и вывод её частоты.
+ *  Вызывается энкодером и командами WebSocket next / prev.
  * ------------------------------------------------------------ */
 void seekStation(uint8_t direction) {
     if (!gRadioFound) {
+        Serial.println("[RADIO] not found — seek ignored");
         return;
     }
 
@@ -814,9 +1112,16 @@ void seekStation(uint8_t direction) {
     // частоту, которую затем возвращает getFrequency().
     rx.seek(RDA_SEEK_WRAP, direction, NULL);
 
-    gDisplayMode = DISPLAY_FREQ;  // сразу показать найденную частоту
-    drawFrequency();
-    gLastDrawMs = millis();
+    gDisplayMode   = DISPLAY_FREQ; // сразу показать найденную частоту
+    gVolumeOverlay = false;
+    gLastDrawMs    = 0;
+
+    // В ручном режиме матрицу не перерисовываем: смена индикации
+    // станет видна после команды "auto".
+    if (!gManualMode) {
+        drawFrequency();
+        gLastDrawMs = millis();
+    }
 
     uint16_t f = rx.getFrequency();
     Serial.printf("[RADIO] seek %s -> %u.%u MHz (RSSI %d)\n",
@@ -829,6 +1134,7 @@ void seekStation(uint8_t direction) {
         gRadioFreq = f;
         markSettingsChanged();
     }
+    notifyStateChanged(); // режим индикации / частота изменились
 }
 
 /* ------------------------------------------------------------
@@ -852,6 +1158,7 @@ void adjustVolume(int8_t delta) {
     gRadioVolume = (uint8_t)v;
     rx.setVolume(gRadioVolume);
     markSettingsChanged();
+    notifyStateChanged(); // сообщить клиентам WebSocket
 
     gVolumeOverlay   = true; // показать шкалу громкости
     gVolumeOverlayMs = millis();
@@ -880,11 +1187,7 @@ void handleEncoder() {
     }
 
     if (enc.isClick()) {
-        gDisplayMode = (gDisplayMode == DISPLAY_TIME) ? DISPLAY_FREQ : DISPLAY_TIME;
-        gVolumeOverlay = false; // клик отменяет показ шкалы громкости
-        gLastDrawMs = 0;
-        Serial.printf("[UI] display -> %s\n",
-                      gDisplayMode == DISPLAY_TIME ? "TIME" : "FREQ");
+        toggleDisplayMode();
     }
 }
 
@@ -936,7 +1239,8 @@ void setup() {
     // 4a. Энергонезависимая память — эмуляция EEPROM во flash ESP8266.
     if (eepromInit()) {
         Serial.printf("[EEPROM] flash emulation ready (%u bytes).\n", (unsigned)EE_SIZE);
-        loadSettings(); // заполняет gRadioFreq / gRadioVolume
+        loadSettings(); // яркость, станция, громкость и цвета цифр
+        FastLED.setBrightness(gBrightness); // применить яркость из flash
     } else {
         Serial.println("[EEPROM] init failed — settings will not be persisted.");
     }
@@ -989,6 +1293,10 @@ void loop() {
 
     // Отложенная запись настроек в EEPROM (через SAVE_DELAY_MS после изменения).
     serviceSettingsSave();
+
+    // Авторассылка состояния клиентам WebSocket после изменений
+    // (не чаще STATE_PUSH_INTERVAL_MS, см. notifyStateChanged()).
+    serviceStateBroadcast();
 
     // В ручном режиме дисплеем управляет пользователь.
     if (gManualMode) {
